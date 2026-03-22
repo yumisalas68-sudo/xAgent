@@ -30,8 +30,11 @@ from config import (APP_PORT, SCRAPEBADGER_API_KEYS, SEARCH_PHRASES_FILE)
 SCRAPEBADGER_SEARCH_URL = "https://scrapebadger.com/v1/twitter/tweets/advanced_search"
 
 
-async def search_phrase(api_key: str, phrase: str, count: int = 20) -> list[dict]:
-    """Call ScrapeBadger advanced tweet search for one phrase."""
+async def search_phrase(api_key: str, phrase: str, count: int = 20) -> tuple[list[dict], bool]:
+    """
+    Call ScrapeBadger advanced tweet search for one phrase.
+    Returns (tweets, depleted) where depleted=True means the account is out of credits.
+    """
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(
@@ -39,15 +42,23 @@ async def search_phrase(api_key: str, phrase: str, count: int = 20) -> list[dict
                 headers={"x-api-key": api_key},
                 params={"query": phrase, "result_type": "recent", "count": count},
             )
+            # 402 = out of credits — mark this key as depleted
+            if r.status_code == 402:
+                print(f"[SEARCH] ⚠️  API key ...{api_key[-6:]} OUT OF CREDITS (402) — skipping for this cycle")
+                return [], True
+
             if not r.is_success:
                 print(f"[SEARCH] HTTP {r.status_code} for '{phrase}': {r.text[:200]}")
-                return []
+                return [], False
+
             data = r.json()
             # Handle both {"data": [...]} and plain list responses
-            return data.get("data", data) if isinstance(data, dict) else data
+            tweets = data.get("data", data) if isinstance(data, dict) else data
+            return (tweets if isinstance(tweets, list) else []), False
+
     except Exception as e:
         print(f"[SEARCH] Error searching '{phrase}': {e}")
-        return []
+        return [], False
 
 
 # ── Hourly search cycle ───────────────────────────────────────────────────────
@@ -65,12 +76,46 @@ async def run_search_cycle():
     print(f"[SCHEDULER] Starting cycle — {len(phrases)} phrases, "
           f"{len(SCRAPEBADGER_API_KEYS)} API keys")
 
-    # Distribute phrases across API keys (round-robin)
+    # Track which API keys have run out of credits this cycle
+    depleted_keys: set[str] = set()
+
+    # Distribute phrases across API keys (round-robin), skipping depleted ones
     total_found = 0
     for i, phrase in enumerate(phrases):
-        api_key = SCRAPEBADGER_API_KEYS[i % len(SCRAPEBADGER_API_KEYS)]
-        tweets  = await search_phrase(api_key, phrase)
-        print(f"[SCHEDULER] '{phrase}' → {len(tweets)} tweets")
+        # Pick next non-depleted key (round-robin)
+        api_key = None
+        for offset in range(len(SCRAPEBADGER_API_KEYS)):
+            candidate = SCRAPEBADGER_API_KEYS[(i + offset) % len(SCRAPEBADGER_API_KEYS)]
+            if candidate not in depleted_keys:
+                api_key = candidate
+                break
+
+        if api_key is None:
+            print(f"[SCHEDULER] ❌ All API keys depleted — stopping cycle early")
+            await send_status_update(
+                "⚠️ *ScrapeBadger Alert*\n"
+                "All API accounts have run out of credits.\n"
+                "Please top up at https://scrapebadger.com/dashboard")
+            break
+
+        tweets, is_depleted = await search_phrase(api_key, phrase)
+        if is_depleted:
+            depleted_keys.add(api_key)
+            # Retry this phrase with the next available key
+            for offset in range(1, len(SCRAPEBADGER_API_KEYS)):
+                fallback = SCRAPEBADGER_API_KEYS[(i + offset) % len(SCRAPEBADGER_API_KEYS)]
+                if fallback not in depleted_keys:
+                    tweets, is_depleted2 = await search_phrase(fallback, phrase)
+                    if is_depleted2:
+                        depleted_keys.add(fallback)
+                    else:
+                        api_key = fallback
+                        break
+            else:
+                tweets = []  # All keys exhausted
+
+        print(f"[SCHEDULER] '{phrase}' → {len(tweets)} tweets"
+              + (f" (key ...{api_key[-6:]})" if api_key else ""))
         total_found += len(tweets)
 
         for tweet in tweets:
@@ -78,6 +123,7 @@ async def run_search_cycle():
             tweet_text = str(tweet.get("text") or tweet.get("full_text") or "")
             raw_url    = tweet.get("url") or tweet.get("tweet_url")
             tweet_url  = str(raw_url) if raw_url else f"https://x.com/i/web/status/{tweet_id}"
+
             if tweet_id and tweet_text:
                 try:
                     await process_tweet(tweet_id, tweet_text, tweet_url)
@@ -87,7 +133,13 @@ async def run_search_cycle():
         # Small delay between phrases to avoid hammering the API
         await asyncio.sleep(2)
 
-    print(f"[SCHEDULER] Cycle complete — {total_found} tweets processed")
+    # Report depleted keys at end of cycle
+    if depleted_keys:
+        count_ok = len(SCRAPEBADGER_API_KEYS) - len(depleted_keys)
+        print(f"[SCHEDULER] Cycle complete — {total_found} tweets | "
+              f"{len(depleted_keys)} key(s) depleted, {count_ok} still active")
+    else:
+        print(f"[SCHEDULER] Cycle complete — {total_found} tweets processed")
 
 
 async def _scheduler_loop():
@@ -106,7 +158,7 @@ async def _scheduler_loop():
 def _load_phrases() -> list[str]:
     try:
         with open(SEARCH_PHRASES_FILE) as f:
-            return [l.strip() for l in f if l.strip()]
+            return [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
         return []
 
@@ -114,20 +166,19 @@ def _load_phrases() -> list[str]:
 # ── App lifespan ──────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup — nothing here crashes the app
     try:    init_db()
     except Exception as e: print(f"[STARTUP] DB error: {e}")
 
     try:    await reference_store.refresh_if_needed()
     except Exception as e: print(f"[STARTUP] Ref store error: {e}")
 
-    try:    await send_status_update(
-                "🟢 *Opportunity Hunter ONLINE*\n"
-                "Agents searching every hour 🔍\n"
-                "Find good opportunities or be turned off. 💀")
+    try:
+        await send_status_update(
+            "🟢 *Opportunity Hunter ONLINE*\n"
+            "Agents searching every hour 🔍\n"
+            "Find good opportunities or be turned off. 💀")
     except Exception as e: print(f"[STARTUP] Telegram error: {e}")
 
-    # Start the hourly scheduler in the background
     task = asyncio.create_task(_scheduler_loop())
     print("[APP] ✅ Started — hourly search scheduler running")
     yield
@@ -139,27 +190,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Opportunity Hunter", lifespan=lifespan)
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"status": "alive"}
 
-
-# ── Stats ─────────────────────────────────────────────────────────────────────
 @app.get("/stats")
 async def stats():
     try:    return get_stats()
     except Exception as e: return {"error": str(e)}
 
-
-# ── Phrases ───────────────────────────────────────────────────────────────────
 @app.get("/phrases")
 async def phrases():
     try:    return {"phrases": get_all_phrases()}
     except Exception as e: return {"error": str(e)}
 
-
-# ── Manual trigger (for testing) ──────────────────────────────────────────────
 @app.get("/run-now")
 async def run_now():
     """Trigger a full search cycle immediately without waiting for the hour."""
