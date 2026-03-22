@@ -23,6 +23,7 @@ REFERENCE_FILE        = "data/real_opportunities.txt"
 # Embedder   → OpenRouter pplx-embed-v1-0.6b ($0.004/M — practically free)
 
 EVALUATOR_GROQ_MODEL  = "llama-3.3-70b-versatile"        # used in evaluator.py directly
+EVALUATOR_MODEL       = EVALUATOR_GROQ_MODEL              # backward-compat alias (old evaluator.py)
 CHECKER_GROQ_MODEL    = "llama-3.1-8b-instant"           # used in checker.py
 TIEBREAKER_MODEL      = "nvidia/nemotron-3-super-120b-a12b:free"   # OpenRouter
 INVENTOR_MODEL        = "nvidia/nemotron-3-super-120b-a12b:free"   # OpenRouter
