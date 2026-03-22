@@ -40,7 +40,7 @@ async def check(tweet_text: str, eval_result: dict, similar_examples: list) -> d
         temperature=0.1,
         max_tokens=120,
     )
-    content = resp.choices[0].message.content.strip()
+    content = (resp.choices[0].message.content or "").strip()
     return _parse(content)
 
 
