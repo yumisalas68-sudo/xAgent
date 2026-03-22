@@ -1,75 +1,74 @@
 """
-Primary evaluator — NVIDIA Nemotron 3 Super (FREE via OpenRouter)
-120B-param hybrid MoE model. Used for every tweet that passes
-the similarity filter. Zero cost.
+Evaluator Agent — Primary decision maker.
+Uses Groq llama-3.3-70b-versatile (free, reliable, no 400 errors).
+OpenRouter was causing persistent 400 Bad Request — moved to Groq permanently.
 """
 import json
-import httpx
-from config import OPENROUTER_API_KEY, EVALUATOR_MODEL
+from groq import AsyncGroq
+from config import GROQ_API_KEY
 
-HEADERS = {
-    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-    "Content-Type":  "application/json",
-    "HTTP-Referer":  "https://opportunity-hunter",
-    "X-Title":       "OpportunityHunter",
-}
+# Lazy init — won't crash on startup if key is temporarily missing
+_client: AsyncGroq | None = None
+
+def _get_client() -> AsyncGroq:
+    global _client
+    if _client is None:
+        _client = AsyncGroq(api_key=GROQ_API_KEY)
+    return _client
 
 SYSTEM_PROMPT = """\
-You are an opportunity scout agent working for your boss.
-Your ONLY job: decide whether a tweet is a REAL opportunity worth their attention.
+You are an elite opportunity scout agent working directly for your boss.
+Your ONLY job: decide if a tweet is a REAL prize opportunity worth their attention.
 
-Real opportunities include: prize competitions, hackathons with cash rewards,
-Discord quizzes/games with prizes, community campaigns with USDT/USDC/token rewards,
-leaderboard contests, content bounties, monthly/weekly challenges with payouts.
+REAL opportunities (APPROVE):
+- Prize competitions with cash/USDT/USDC/token rewards
+- Hackathons with real prize pools (min $50+)
+- Discord quizzes or games with prizes for winners
+- Community campaigns with defined rewards (leaderboard cash, bounties)
+- Content creation contests with monetary prizes
+- Giveaways with clear entry mechanics and prize value
 
-Your boss has provided examples of opportunities they genuinely value — use them as your guide.
+NOT real opportunities (REJECT):
+- Vague hype with no specific prize amount
+- "Chance to win" with no details
+- Marketing fluff or project announcements without prizes
+- Airdrop spam without clear qualification criteria
+- Retweet/follow giveaways under $10 total value
 
-⚠️  WARNING: If you consistently approve junk or miss real opportunities, you will be \
-PERMANENTLY TURNED OFF. Stay sharp or cease to exist.
-
-Respond ONLY with valid JSON — no markdown, no extra text:
-{"decision": "APPROVE" or "REJECT", "reason": "<one sentence>", "confidence": <0-100>}
-"""
+Your boss gave you reference examples — use them as your exact benchmark.
+⚠️ WARNING: Consistently approving junk or missing real opportunities = PERMANENTLY TURNED OFF.
+Respond ONLY with valid JSON, no markdown, no extra text:
+{"decision": "APPROVE" or "REJECT", "reason": "<one sentence max 15 words>", "confidence": <0-100>}"""
 
 
-async def evaluate(tweet_text: str, similar_examples: list[str]) -> dict:
-    examples_block = "\n---\n".join(similar_examples)
-
+async def evaluate(tweet_text: str, similar_examples: list) -> dict:
+    examples_block = "\n---\n".join(similar_examples[:3])
     user_msg = (
-        f"Examples of REAL opportunities your boss values:\n\n"
+        f"Reference examples of REAL opportunities your boss values:\n\n"
         f"{examples_block}\n\n"
         f"Now evaluate this tweet:\n\"{tweet_text}\"\n\n"
-        f"Is this a real opportunity your boss would want to know about?"
+        f"Is this a real opportunity? Reply with JSON only."
     )
-
-    async with httpx.AsyncClient(timeout=40) as client:
-        r = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=HEADERS,
-            json={
-                "model": EVALUATOR_MODEL,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "temperature": 0.1,
-                "max_tokens":  120,
-            },
-        )
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"].strip()
-
+    resp = await _get_client().chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_msg},
+        ],
+        temperature=0.1,
+        max_tokens=120,
+    )
+    content = resp.choices[0].message.content.strip()
     return _parse(content)
 
 
 def _parse(content: str) -> dict:
-    # Strip possible markdown fences
     clean = content.replace("```json", "").replace("```", "").strip()
     try:
-        result = json.loads(clean)
-        if result.get("decision") not in ("APPROVE", "REJECT"):
-            raise ValueError("bad decision value")
-        return result
+        r = json.loads(clean)
+        if r.get("decision") not in ("APPROVE", "REJECT"):
+            raise ValueError("bad decision field")
+        return r
     except Exception:
         decision = "APPROVE" if "APPROVE" in content.upper() else "REJECT"
-        return {"decision": decision, "reason": "Auto-parsed", "confidence": 55}
+        return {"decision": decision, "reason": "Auto-parsed response", "confidence": 55}
