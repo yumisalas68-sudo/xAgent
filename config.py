@@ -32,5 +32,5 @@ EMBED_MODEL           = "perplexity/pplx-embed-v1-0.6b"            # OpenRouter 
 # ── Pipeline thresholds ────────────────────────────────────────────────────────
 SIMILARITY_MIN        = 0.45   # Below this → discard immediately (no LLM cost)
 SIMILARITY_FAST_TRACK = 0.75   # Above this → skip tiebreaker even if checker disagrees
-AGENT_DEATH_SCORE     = 35.0   # Agent disabled if accuracy falls below this %
+AGENT_DEATH_SCORE     = 15.0   # Agent disabled if accuracy falls below this %
 INVENT_PHRASES_EVERY_N_APPROVALS = 10  # Trigger phrase invention every N approvals
