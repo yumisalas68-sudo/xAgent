@@ -24,11 +24,11 @@ from core.database         import init_db, get_stats, get_all_phrases, save_new_
 from core.reference_loader import reference_store
 from core.pipeline         import process_tweet
 from telegram_bot.notifier import send_status_update
-from config import (APP_PORT, SCRAPEBADGER_API_KEYS,
-                    SEARCH_PHRASES_FILE)
+from config import (APP_PORT, SCRAPEBADGER_API_KEYS, SEARCH_PHRASES_FILE)
 
-# ── ScrapeBadger search ───────────────────────────────────────────────────────
+# ── ScrapeBadger advanced search (correct endpoint) ───────────────────────────
 SCRAPEBADGER_SEARCH_URL = "https://scrapebadger.com/v1/twitter/tweets/advanced_search"
+
 
 async def search_phrase(api_key: str, phrase: str, count: int = 20) -> list[dict]:
     """Call ScrapeBadger advanced tweet search for one phrase."""
@@ -39,7 +39,9 @@ async def search_phrase(api_key: str, phrase: str, count: int = 20) -> list[dict
                 headers={"x-api-key": api_key},
                 params={"query": phrase, "result_type": "recent", "count": count},
             )
-            r.raise_for_status()
+            if not r.is_success:
+                print(f"[SEARCH] HTTP {r.status_code} for '{phrase}': {r.text[:200]}")
+                return []
             data = r.json()
             # Handle both {"data": [...]} and plain list responses
             return data.get("data", data) if isinstance(data, dict) else data
