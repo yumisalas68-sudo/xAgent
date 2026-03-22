@@ -1,13 +1,16 @@
 """
 Phrase Inventor Agent — Generates new search phrases from approved opportunities.
 Uses OpenRouter nvidia/nemotron-3-super-120b-a12b:free (free, large context).
-Fires every N approved opportunities (set in config).
+⚠️  Nemotron is a reasoning model — content field can be null.
+    Falls back to 'reasoning' field, then to Groq llama-3.1-8b-instant.
 """
 import json
+import re
 import httpx
-from config import OPENROUTER_API_KEY, INVENTOR_MODEL
+from groq import AsyncGroq
+from config import OPENROUTER_API_KEY, GROQ_API_KEY, INVENTOR_MODEL
 
-HEADERS = {
+OR_HEADERS = {
     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
     "Content-Type": "application/json",
     "HTTP-Referer": "https://opportunity-hunter",
@@ -29,40 +32,71 @@ Rules:
 Respond ONLY with valid JSON array of strings, no markdown:
 ["phrase one", "phrase two", "phrase three", ...]"""
 
+_groq: AsyncGroq | None = None
+def _get_groq() -> AsyncGroq:
+    global _groq
+    if _groq is None:
+        _groq = AsyncGroq(api_key=GROQ_API_KEY)
+    return _groq
+
+
+def _extract_content(resp_json: dict) -> str:
+    """Extract text content — Nemotron may return null content, fall back to reasoning."""
+    try:
+        msg = resp_json["choices"][0]["message"]
+        content = msg.get("content") or msg.get("reasoning") or ""
+        return content.strip()
+    except (KeyError, IndexError, TypeError):
+        return ""
+
 
 async def invent_phrases(approved_tweets: list[str], existing_phrases: list[str]) -> list[str]:
     approved_sample = "\n".join(f"• {t[:200]}" for t in approved_tweets[:15])
     existing_block  = ", ".join(existing_phrases[:30])
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            f"Recent approved opportunities:\n{approved_sample}\n\n"
+            f"Existing search phrases (DO NOT duplicate):\n{existing_block}\n\n"
+            f"Generate 5-8 new search phrases. Reply with JSON array only."
+        )},
+    ]
 
-    user_msg = (
-        f"Recent approved opportunities:\n{approved_sample}\n\n"
-        f"Existing search phrases (DO NOT duplicate):\n{existing_block}\n\n"
-        f"Generate 5-8 new search phrases. Reply with JSON array only."
-    )
-    async with httpx.AsyncClient(timeout=40) as client:
-        r = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=HEADERS,
-            json={
-                "model": INVENTOR_MODEL,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "temperature": 0.7,
-                "max_tokens": 200,
-            },
+    # Try OpenRouter (Nemotron) first
+    content = ""
+    try:
+        async with httpx.AsyncClient(timeout=40) as client:
+            r = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=OR_HEADERS,
+                json={"model": INVENTOR_MODEL, "messages": messages,
+                      "temperature": 0.7, "max_tokens": 250},
+            )
+            if r.is_success:
+                content = _extract_content(r.json())
+                if not content:
+                    print("[INVENTOR] Nemotron returned empty content — falling back to Groq")
+            else:
+                print(f"[INVENTOR] OpenRouter {r.status_code}: {r.text[:300]}")
+    except Exception as e:
+        print(f"[INVENTOR] OpenRouter error: {e} — falling back to Groq")
+
+    # Fallback to Groq if OpenRouter gave nothing
+    if not content:
+        resp = await _get_groq().chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=200,
         )
-        if not r.is_success:
-            print(f"[INVENTOR] OpenRouter error {r.status_code}: {r.text[:500]}")
-            r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"].strip()
+        content = (resp.choices[0].message.content or "").strip()
+
     return _parse(content, existing_phrases)
 
 
 def _parse(content: str, existing: list[str]) -> list[str]:
-    clean = content.replace("```json", "").replace("```", "").strip()
     existing_lower = {p.lower() for p in existing}
+    clean = content.replace("```json", "").replace("```", "").strip()
     try:
         phrases = json.loads(clean)
         if isinstance(phrases, list):
@@ -74,6 +108,5 @@ def _parse(content: str, existing: list[str]) -> list[str]:
     except Exception:
         pass
     # Fallback: extract quoted strings
-    import re
     found = re.findall(r'"([^"]{3,50})"', content)
     return [p for p in found if p.lower() not in existing_lower][:8]
