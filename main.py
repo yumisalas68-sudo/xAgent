@@ -75,9 +75,9 @@ async def run_search_cycle():
 
         for tweet in tweets:
             tweet_id   = str(tweet.get("id") or tweet.get("tweet_id") or "")
-            tweet_text = tweet.get("text") or tweet.get("full_text") or ""
-            tweet_url  = (tweet.get("url") or tweet.get("tweet_url") or
-                          f"https://x.com/i/web/status/{tweet_id}")
+            tweet_text = str(tweet.get("text") or tweet.get("full_text") or "")
+            raw_url    = tweet.get("url") or tweet.get("tweet_url")
+            tweet_url  = str(raw_url) if raw_url else f"https://x.com/i/web/status/{tweet_id}"
             if tweet_id and tweet_text:
                 try:
                     await process_tweet(tweet_id, tweet_text, tweet_url)
