@@ -83,7 +83,9 @@ async def process_tweet(tweet_id: str, tweet_text: str, tweet_url: str):
             try:
                 tb = await tiebreak(str(tweet_text), eval_res, check_res, similar_examples)
                 final = tb["decision"]
-                update_agent("mistral_tiebreaker", approved=(final == "APPROVE"))
+                # NOTE: Tiebreaker IS the final decision — there is no ground truth
+                # to compare it against in real-time, so we don't score it here.
+                # It will only be scored when user feedback is added later.
             except Exception as e:
                 print(f"[PIPELINE] Tiebreaker error {tweet_id}: {e}")
                 final = "REJECT"
