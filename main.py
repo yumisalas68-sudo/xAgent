@@ -28,7 +28,7 @@ from config import (APP_PORT, SCRAPEBADGER_API_KEYS,
                     SEARCH_PHRASES_FILE)
 
 # ── ScrapeBadger search ───────────────────────────────────────────────────────
-SCRAPEBADGER_SEARCH_URL = "https://scrapebadger.com/v1/twitter/tweets/search"
+SCRAPEBADGER_SEARCH_URL = "https://scrapebadger.com/v1/twitter/tweets/advanced_search"
 
 async def search_phrase(api_key: str, phrase: str, count: int = 20) -> list[dict]:
     """Call ScrapeBadger advanced tweet search for one phrase."""
