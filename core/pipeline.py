@@ -1,160 +1,139 @@
 """
-Full processing pipeline for a single incoming tweet.
+Pipeline — processes each tweet through the agent chain.
 
-Steps
-──────
-1. Dedup check             → skip if already seen
-2. Reference store refresh → reload if file changed
-3. Embed tweet             → vector
-4. Similarity filter       → discard below SIMILARITY_MIN (no LLM)
-5. Primary eval            → Nemotron FREE
-6. Cross-check             → Groq llama FREE
-7. Tiebreaker (if needed)  → Mistral Small (paid, rare)
-8. Save + notify Telegram
+Scoring logic (fixed):
+  Agents are scored on CORRECTNESS vs final outcome, not on approval rate.
+  checker=REJECT + final=REJECT → checker was RIGHT → score goes UP
+  checker=APPROVE + final=REJECT → checker was wrong (false alarm) → score goes DOWN
+  checker=REJECT + final=APPROVE → checker missed it → score goes DOWN
 """
 import asyncio
-from core.database      import (is_seen, mark_seen, save_opportunity,
-                                 update_agent, get_approved_tweets,
-                                 get_all_phrases, save_new_phrase, get_stats)
-from core.embedder      import embed_one
+from core.database import (is_seen, mark_seen, save_opportunity, update_agent,
+                            get_approved_tweets, get_all_phrases, save_new_phrase)
+from core.embedder import embed_one
 from core.reference_loader import reference_store
-from agents.evaluator   import evaluate
-from agents.checker     import check
-from agents.tiebreaker  import tiebreak
+from agents.evaluator import evaluate
+from agents.checker import check
+from agents.tiebreaker import tiebreak
 from agents.phrase_inventor import invent_phrases
-from telegram_bot.notifier  import send_opportunity, send_status_update
-from config import (SIMILARITY_MIN, SIMILARITY_FAST_TRACK,
-                    INVENT_PHRASES_EVERY_N_APPROVALS)
+from telegram_bot.notifier import send_opportunity, send_status_update
+from config import SIMILARITY_MIN, SIMILARITY_FAST_TRACK, INVENT_PHRASES_EVERY_N_APPROVALS
 
-
-# Track approvals for phrase-invention trigger
 _approvals_since_invention = 0
 
 
 async def process_tweet(tweet_id: str, tweet_text: str, tweet_url: str):
     global _approvals_since_invention
 
-    # ── 1. Dedup ──────────────────────────────────────────────────────────────
+    # ── Dedup ─────────────────────────────────────────────────────────────────
     if is_seen(tweet_id):
         return
     mark_seen(tweet_id)
 
-    # ── 2. Reference store ────────────────────────────────────────────────────
+    # ── Refresh reference store if file changed ────────────────────────────────
     await reference_store.refresh_if_needed()
 
-    # ── 3. Embed ──────────────────────────────────────────────────────────────
+    # ── Embed tweet ────────────────────────────────────────────────────────────
     try:
-        tweet_emb = await embed_one(tweet_text)
+        tweet_emb = await embed_one(str(tweet_text))
     except Exception as e:
-        print(f"[PIPELINE] Embed error for {tweet_id}: {e}")
+        print(f"[PIPELINE] Embed error {tweet_id}: {e}")
         return
 
-    # ── 4. Similarity filter ──────────────────────────────────────────────────
+    # ── Similarity filter ──────────────────────────────────────────────────────
     sim_score, similar_examples = reference_store.top_k(tweet_emb)
-
     if sim_score < SIMILARITY_MIN:
-        return   # silent discard – not remotely relevant
+        return
 
     print(f"[PIPELINE] Tweet {tweet_id} | sim={sim_score:.2f} | passed filter")
 
-    # ── 5. Primary eval (Nemotron free) ───────────────────────────────────────
+    # ── Evaluator (Groq llama-3.3-70b) ────────────────────────────────────────
     try:
-        eval_res = await evaluate(tweet_text, similar_examples)
+        eval_res = await evaluate(str(tweet_text), similar_examples)
     except Exception as e:
-        print(f"[PIPELINE] Evaluator error: {e}")
+        print(f"[PIPELINE] Evaluator error {tweet_id}: {e}")
         return
 
-    update_agent("nemotron_evaluator",
-                 approved=eval_res["decision"] == "APPROVE")
+    update_agent("nemotron_evaluator", approved=(eval_res["decision"] == "APPROVE"))
 
+    # Evaluator rejected — log and exit early (no Telegram)
     if eval_res["decision"] == "REJECT":
-        _log(tweet_id, tweet_text, tweet_url, sim_score,
-             eval_res, {"decision": "N/A", "reason": "skipped"}, "REJECT")
+        save_opportunity(tweet_id, str(tweet_text), str(tweet_url), sim_score,
+                         eval_res["decision"], str(eval_res.get("reason") or ""),
+                         "N/A", "REJECT")
         return
 
-    # ── 6. Cross-check (Groq free) ────────────────────────────────────────────
+    # ── Checker (Groq llama-3.1-8b) ───────────────────────────────────────────
     try:
-        check_res = await check(tweet_text, eval_res, similar_examples)
+        check_res = await check(str(tweet_text), eval_res, similar_examples)
     except Exception as e:
-        print(f"[PIPELINE] Checker error: {e}")
+        print(f"[PIPELINE] Checker error {tweet_id}: {e}")
         check_res = {"decision": "APPROVE", "reason": "Checker unavailable", "confidence": 50}
 
-    # ── 7. Determine final decision ───────────────────────────────────────────
+    # ── Consensus ─────────────────────────────────────────────────────────────
     if eval_res["decision"] == "APPROVE" and check_res["decision"] == "APPROVE":
         final = "APPROVE"
+
     elif eval_res["decision"] == "APPROVE" and check_res["decision"] == "REJECT":
+        # High similarity → trust evaluator even without checker agreement
         if sim_score >= SIMILARITY_FAST_TRACK:
-            final = "APPROVE"   # high similarity → trust eval
+            final = "APPROVE"
         else:
-            # Disagreement + borderline similarity → call tiebreaker
+            # Tiebreaker (Nemotron/Groq fallback)
             try:
-                tb_res = await tiebreak(tweet_text, eval_res, check_res, similar_examples)
-                final  = tb_res["decision"]
+                tb = await tiebreak(str(tweet_text), eval_res, check_res, similar_examples)
+                final = tb["decision"]
                 update_agent("mistral_tiebreaker", approved=(final == "APPROVE"))
             except Exception as e:
-                print(f"[PIPELINE] Tiebreaker error: {e}")
+                print(f"[PIPELINE] Tiebreaker error {tweet_id}: {e}")
                 final = "REJECT"
     else:
         final = "REJECT"
 
-    # ── 8. Update checker score ───────────────────────────────────────────────
-    false_alarm = check_res["decision"] == "APPROVE" and final == "REJECT"
-    update_agent("groq_checker",
-                 approved=check_res["decision"] == "APPROVE",
-                 false_alarm=false_alarm)
+    # ── Score checker on CORRECTNESS (not just approval rate) ────────────────
+    # Checker is correct when its decision matches the final outcome.
+    checker_correct   = (check_res["decision"] == final)
+    checker_false_alarm = (check_res["decision"] == "APPROVE" and final == "REJECT")
+    update_agent("groq_checker", approved=checker_correct, false_alarm=checker_false_alarm)
 
-    # ── 9. Save to DB ─────────────────────────────────────────────────────────
-    _log(tweet_id, tweet_text, tweet_url, sim_score,
-         eval_res, check_res, final)
-
-    # ── 10. Notify ────────────────────────────────────────────────────────────
-    if final == "APPROVE":
-        avg_conf = (eval_res.get("confidence", 70) + check_res.get("confidence", 70)) / 2
-        await send_opportunity(
-            tweet_text    = tweet_text,
-            tweet_url     = tweet_url,
-            sim_score     = sim_score,
-            eval_reason   = eval_res.get("reason", ""),
-            check_reason  = check_res.get("reason", ""),
-            confidence    = avg_conf,
-        )
-
-        _approvals_since_invention += 1
-
-        # ── 11. Phrase invention trigger ──────────────────────────────────────
-        if _approvals_since_invention >= INVENT_PHRASES_EVERY_N_APPROVALS:
-            _approvals_since_invention = 0
-            asyncio.create_task(_run_phrase_inventor())
-
-
-def _log(tweet_id, tweet_text, tweet_url, sim_score, eval_res, check_res, final):
+    # ── Persist ───────────────────────────────────────────────────────────────
     save_opportunity(
-        tweet_id        = tweet_id,
-        tweet_text      = tweet_text,
-        tweet_url       = tweet_url,
-        similarity_score= sim_score,
-        eval_decision   = eval_res["decision"],
-        eval_reason     = eval_res.get("reason", ""),
-        checker_decision= check_res["decision"],
-        final_decision  = final,
+        tweet_id, str(tweet_text), str(tweet_url), sim_score,
+        eval_res["decision"], str(eval_res.get("reason") or ""),
+        check_res["decision"], final,
     )
 
+    # ── Notify ────────────────────────────────────────────────────────────────
+    if final == "APPROVE":
+        avg_conf = (eval_res.get("confidence", 70) + check_res.get("confidence", 70)) / 2
+        try:
+            await send_opportunity(
+                str(tweet_text), str(tweet_url), sim_score,
+                str(eval_res.get("reason") or ""),
+                str(check_res.get("reason") or ""),
+                avg_conf,
+            )
+        except Exception as e:
+            print(f"[PIPELINE] Telegram error {tweet_id}: {e}")
 
-async def _run_phrase_inventor():
-    """Background task: invent new search phrases from approved tweets."""
+        _approvals_since_invention += 1
+        if _approvals_since_invention >= INVENT_PHRASES_EVERY_N_APPROVALS:
+            _approvals_since_invention = 0
+            asyncio.create_task(_invent())
+
+
+async def _invent():
     try:
-        approved_tweets  = get_approved_tweets(limit=20)
-        existing_phrases = get_all_phrases()
-        if not approved_tweets:
+        approved = get_approved_tweets(20)
+        existing = get_all_phrases()
+        if not approved:
             return
-        new_phrases = await invent_phrases(approved_tweets, existing_phrases)
-        for phrase in new_phrases:
-            save_new_phrase(phrase)
+        new_phrases = await invent_phrases(approved, existing)
+        for p in new_phrases:
+            save_new_phrase(p)
         if new_phrases:
             await send_status_update(
-                f"💡 *Phrase Inventor* generated {len(new_phrases)} new search phrases:\n"
-                + "\n".join(f"• `{p}`" for p in new_phrases)
-            )
-            print(f"[INVENTOR] New phrases: {new_phrases}")
+                f"💡 *Phrase Inventor* generated {len(new_phrases)} new phrases:\n"
+                + "\n".join(f"• `{p}`" for p in new_phrases))
     except Exception as e:
         print(f"[INVENTOR] Error: {e}")
