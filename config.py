@@ -27,13 +27,13 @@ REFERENCE_FILE       = "data/real_opportunities.txt"
 
 # ── Models ────────────────────────────────────────────────────────────────────
 # Primary evaluator  – NVIDIA Nemotron 3 Super FREE via OpenRouter
-EVALUATOR_MODEL     = "nvidia/nemotron-3-super:free"
+EVALUATOR_MODEL     = "nnvidia/nemotron-3-super-120b-a12b:free"
 # Cross-checker      – Groq llama-3.3-70b  (free tier)
 CHECKER_GROQ_MODEL  = "llama-3.3-70b-versatile"
 # Tiebreaker         – Mistral Small 4 (cheapest paid: $0.15/$0.60 per M)
-TIEBREAKER_MODEL    = "mistralai/mistral-small"
+TIEBREAKER_MODEL    = "mistralai/devstral-small"
 # Phrase inventor    – Nemotron free  (no cost)
-INVENTOR_MODEL      = "nvidia/nemotron-3-super:free"
+INVENTOR_MODEL      = "nvidia/nemotron-3-super-120b-a12b:free"
 # Embeddings         – Perplexity Embed 0.6B  ($0.004/M ≈ free)
 EMBED_MODEL         = "perplexity/pplx-embed-v1-0.6b"
 
