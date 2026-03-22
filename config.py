@@ -1,48 +1,35 @@
 import os
 from dotenv import load_dotenv
-
 load_dotenv()
 
-# ── ScrapeBadger ─────────────────────────────────────────────────────────────
-# Comma-separated list of API keys, one per account
+# ── API credentials ────────────────────────────────────────────────────────────
 SCRAPEBADGER_API_KEYS = [k.strip() for k in os.getenv("SCRAPEBADGER_API_KEYS", "").split(",") if k.strip()]
+OPENROUTER_API_KEY    = os.getenv("OPENROUTER_API_KEY", "")
+GROQ_API_KEY          = os.getenv("GROQ_API_KEY", "")
+TELEGRAM_BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "")
+WEBHOOK_BASE_URL      = os.getenv("WEBHOOK_BASE_URL", "")
+APP_PORT              = int(os.getenv("PORT", 8000))
 
-# ── OpenRouter ────────────────────────────────────────────────────────────────
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+# ── Data file paths ────────────────────────────────────────────────────────────
+SEARCH_PHRASES_FILE   = "data/search_phrases.txt"
+REFERENCE_FILE        = "data/real_opportunities.txt"
 
-# ── Groq ──────────────────────────────────────────────────────────────────────
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+# ── Model assignments ──────────────────────────────────────────────────────────
+# Evaluator  → Groq llama-3.3-70b-versatile  (PRIMARY — free, reliable, NO 400 errors)
+# Checker    → Groq llama-3.1-8b-instant     (SECONDARY — fast cross-validator)
+# Tiebreaker → OpenRouter nemotron free      (RARELY called — only on Eval/Check disagreement)
+# Inventor   → OpenRouter nemotron free      (phrase generation — large context)
+# Embedder   → OpenRouter pplx-embed-v1-0.6b ($0.004/M — practically free)
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+EVALUATOR_GROQ_MODEL  = "llama-3.3-70b-versatile"        # used in evaluator.py directly
+CHECKER_GROQ_MODEL    = "llama-3.1-8b-instant"           # used in checker.py
+TIEBREAKER_MODEL      = "nvidia/nemotron-3-super-120b-a12b:free"   # OpenRouter
+INVENTOR_MODEL        = "nvidia/nemotron-3-super-120b-a12b:free"   # OpenRouter
+EMBED_MODEL           = "perplexity/pplx-embed-v1-0.6b"            # OpenRouter embeddings
 
-# ── App ───────────────────────────────────────────────────────────────────────
-WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "")   # e.g. https://xyz.railway.app
-APP_PORT         = int(os.getenv("PORT", 8000))
-
-# ── Data files ────────────────────────────────────────────────────────────────
-SEARCH_PHRASES_FILE  = "data/search_phrases.txt"
-REFERENCE_FILE       = "data/real_opportunities.txt"
-
-# ── Models ────────────────────────────────────────────────────────────────────
-# Primary evaluator  – NVIDIA Nemotron 3 Super FREE via OpenRouter
-EVALUATOR_MODEL     = "nnvidia/nemotron-3-super-120b-a12b:free"
-# Cross-checker      – Groq llama-3.3-70b  (free tier)
-CHECKER_GROQ_MODEL  = "llama-3.3-70b-versatile"
-# Tiebreaker         – Mistral Small 4 (cheapest paid: $0.15/$0.60 per M)
-TIEBREAKER_MODEL    = "mistralai/devstral-small"
-# Phrase inventor    – Nemotron free  (no cost)
-INVENTOR_MODEL      = "nvidia/nemotron-3-super-120b-a12b:free"
-# Embeddings         – Perplexity Embed 0.6B  ($0.004/M ≈ free)
-EMBED_MODEL         = "perplexity/pplx-embed-v1-0.6b"
-
-# ── Pipeline thresholds ───────────────────────────────────────────────────────
-SIMILARITY_MIN        = 0.45   # below this → instant discard, no LLM call
-SIMILARITY_FAST_TRACK = 0.75   # above this → if eval says APPROVE, skip tiebreaker
-
-# ── Agent survival ────────────────────────────────────────────────────────────
-AGENT_DEATH_SCORE = 35.0       # score% below which agent is marked DEAD
-
-# ── Phrase invention schedule ─────────────────────────────────────────────────
-INVENT_PHRASES_EVERY_N_APPROVALS = 10   # invent new phrases after every 10 approvals
+# ── Pipeline thresholds ────────────────────────────────────────────────────────
+SIMILARITY_MIN        = 0.45   # Below this → discard immediately (no LLM cost)
+SIMILARITY_FAST_TRACK = 0.75   # Above this → skip tiebreaker even if checker disagrees
+AGENT_DEATH_SCORE     = 35.0   # Agent disabled if accuracy falls below this %
+INVENT_PHRASES_EVERY_N_APPROVALS = 10  # Trigger phrase invention every N approvals
